@@ -47,9 +47,14 @@ def initialize_components():
         )
 
     if groq_client is None:
-        api_key = os.getenv("GROQ_API_KEY")
+        # Try Streamlit secrets first (for cloud), then fallback to .env
+        try:
+            import streamlit as st
+            api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
+        except Exception:
+            api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
-            raise RuntimeError("GROQ_API_KEY not found in .env file")
+            raise RuntimeError("GROQ_API_KEY not found. Set it in Streamlit secrets or .env file")
         groq_client = Groq(api_key=api_key)
 
 
