@@ -7,7 +7,7 @@ from uuid import uuid4
 from pathlib import Path
 from dotenv import load_dotenv
 
-from unstructured.partition.html import partition_html
+from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 
 import chromadb
@@ -59,15 +59,21 @@ def initialize_components():
 
 
 def load_url_content(url):
-    """Scrape content from a URL using unstructured."""
+    """Scrape content from a URL using BeautifulSoup."""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        elements = partition_html(text=response.text)
-        text = "\n\n".join([str(el) for el in elements])
+        soup = BeautifulSoup(response.text, "html.parser")
+        # Remove script and style elements
+        for element in soup(["script", "style", "nav", "footer", "header"]):
+            element.decompose()
+        # Get text and clean up whitespace
+        text = soup.get_text(separator="\n")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        text = "\n\n".join(lines)
         return text
     except Exception as e:
         print(f"Error loading {url}: {e}")

@@ -3,5 +3,5 @@ chromadb
 groq
 sentence-transformers
 python-dotenv
-unstructured
+beautifulsoup4
 requests
