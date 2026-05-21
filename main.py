@@ -2,6 +2,7 @@
 # Modified to use ChromaDB + SentenceTransformers + Groq API for RAG pipeline
 
 import streamlit as st
+from uuid import uuid4
 from rag import process_urls, generate_answer_with_healing
 
 st.title("AI Assistant Research Tool")
@@ -9,6 +10,8 @@ st.title("AI Assistant Research Tool")
 # Initialize session state to track URL processing across reruns
 if "urls_processed" not in st.session_state:
     st.session_state.urls_processed = False
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid4())
 
 url1 = st.sidebar.text_input("URL 1")
 url2 = st.sidebar.text_input("URL 2")
@@ -57,12 +60,12 @@ if query_button and query:
     else:
         try:
             with st.spinner("Generating and verifying answer..."):
-                answer, sources, eval_info = generate_answer_with_healing(query)
+                answer, sources, eval_info = generate_answer_with_healing(query, session_id=st.session_state.session_id)
 
             # Flush Langfuse traces to ensure they are sent
             try:
-                from langfuse import get_client
-                get_client().flush()
+                from langfuse.decorators import langfuse_context
+                langfuse_context.flush()
             except Exception:
                 pass
 

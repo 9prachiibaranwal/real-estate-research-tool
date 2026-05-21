@@ -31,7 +31,7 @@ except Exception:
     pass
 
 # Langfuse observability — imported AFTER load_dotenv() per Langfuse best practices
-from langfuse import get_client as get_langfuse_client
+from langfuse.decorators import observe, langfuse_context
 
 # Constants
 CHUNK_SIZE = 1000
@@ -226,88 +226,66 @@ def process_urls(urls):
     yield f"✅ Done! Added {len(all_chunks)} chunks to vector database."
 
 
+@observe(as_type="span", name="chromadb-retrieval")
+def _retrieve_chunks(query, n_retrieve):
+    query_embedding = embedding_model.encode([query]).tolist()
+    results = collection.query(
+        query_embeddings=query_embedding,
+        n_results=n_retrieve,
+        include=["documents", "metadatas", "distances"]
+    )
+    documents = results["documents"][0]
+    
+    # Update Langfuse observation safely
+    try:
+        langfuse_context.update_current_observation(output={"chunks_retrieved": len(documents)})
+    except Exception:
+        pass
+        
+    return documents, results["metadatas"][0], results["distances"][0]
+
+
+@observe(as_type="span", name="cross-encoder-reranking")
+def _rerank_chunks(query, documents, metadatas, distances, top_k):
+    query_doc_pairs = [[query, doc] for doc in documents]
+    rerank_scores = reranker_model.predict(query_doc_pairs)
+
+    ranked = sorted(
+        zip(documents, metadatas, distances, rerank_scores),
+        key=lambda x: x[3],
+        reverse=True
+    )
+
+    context_parts = []
+    sources_set = set()
+    for doc, meta, dist, score in ranked[:top_k]:
+        source = meta.get("source", "Unknown")
+        sources_set.add(source)
+        context_parts.append(f"[Source: {source}]\n{doc}")
+
+    try:
+        langfuse_context.update_current_observation(output={"top_k_selected": len(context_parts)})
+    except Exception:
+        pass
+
+    return context_parts, sources_set
+
+
+@observe(as_type="generation", name="groq-answer-generation")
 def generate_answer(query, n_retrieve=10, top_k=4, strict_mode=False):
     if collection is None:
         raise RuntimeError("Collection is None -- initialize_components() was not called")
     if collection.count() == 0:
         raise RuntimeError("Vector database is empty. Please process URLs first.")
 
-    try:
-        langfuse = get_langfuse_client()
-    except Exception:
-        langfuse = None
+    documents, metadatas, distances = _retrieve_chunks(query, n_retrieve)
+    context_parts, sources_set = _rerank_chunks(query, documents, metadatas, distances, top_k)
 
-    query_embedding = embedding_model.encode([query]).tolist()
+    if not context_parts:
+        no_info_answer = "I don't have enough information in the provided articles to answer this question."
+        return no_info_answer, "", ""
 
-    retrieval_ctx = None
-    if langfuse:
-        retrieval_ctx = langfuse.start_as_current_observation(
-            as_type="span", name="chromadb-retrieval",
-            input={"query": query, "n_results": n_retrieve},
-        )
-
-    try:
-        if retrieval_ctx:
-            retrieval_obs = retrieval_ctx.__enter__()
-
-        results = collection.query(
-            query_embeddings=query_embedding,
-            n_results=n_retrieve,
-            include=["documents", "metadatas", "distances"]
-        )
-        documents = results["documents"][0]
-        metadatas = results["metadatas"][0]
-        distances = results["distances"][0]
-
-        if retrieval_ctx:
-            retrieval_obs.update(output={"chunks_retrieved": len(documents)})
-    finally:
-        if retrieval_ctx:
-            retrieval_ctx.__exit__(None, None, None)
-
-    rerank_ctx = None
-    if langfuse:
-        rerank_ctx = langfuse.start_as_current_observation(
-            as_type="span", name="cross-encoder-reranking",
-            input={"query": query, "num_candidates": len(documents)},
-        )
-
-    try:
-        if rerank_ctx:
-            rerank_obs = rerank_ctx.__enter__()
-
-        query_doc_pairs = [[query, doc] for doc in documents]
-        rerank_scores = reranker_model.predict(query_doc_pairs)
-
-        ranked = sorted(
-            zip(documents, metadatas, distances, rerank_scores),
-            key=lambda x: x[3],
-            reverse=True
-        )
-
-        # Remove the strict ChromaDB distance filter. The reranker has already
-        # ordered the best chunks, and the LLM is explicitly prompted to say 
-        # "I don't know" if the provided context doesn't contain the answer.
-        context_parts = []
-        sources_set = set()
-        for doc, meta, dist, score in ranked[:top_k]:
-            source = meta.get("source", "Unknown")
-            sources_set.add(source)
-            context_parts.append(f"[Source: {source}]\n{doc}")
-
-        if not context_parts:
-            no_info_answer = "I don't have enough information in the provided articles to answer this question."
-            if rerank_ctx:
-                rerank_obs.update(output={"top_k_selected": 0, "early_exit": True})
-            return no_info_answer, "", ""
-
-        context = "\n\n".join(context_parts)
-
-        if rerank_ctx:
-            rerank_obs.update(output={"top_k_selected": len(context_parts)})
-    finally:
-        if rerank_ctx:
-            rerank_ctx.__exit__(None, None, None)
+    context = "\n\n".join(context_parts)
 
     if strict_mode:
         prompt = f"""You are answering a question using ONLY the context below.
@@ -336,50 +314,32 @@ Question: {query}
 
 Answer:"""
 
-    gen_ctx = None
-    if langfuse:
-        gen_ctx = langfuse.start_as_current_observation(
-            as_type="generation", name="groq-answer-generation",
-            model="llama-3.3-70b-versatile",
-            input=[{"role": "system", "content": "Research assistant"}, {"role": "user", "content": prompt}],
-            metadata={"n_retrieve": n_retrieve, "top_k": top_k, "strict_mode": strict_mode},
-        )
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a helpful research assistant that answers questions based ONLY on the provided context."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1 if strict_mode else 0.2,
+        max_tokens=500
+    )
+
+    answer = response.choices[0].message.content
+    sources_str = "\n".join(sources_set)
 
     try:
-        if gen_ctx:
-            gen_obs = gen_ctx.__enter__()
-
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "You are a helpful research assistant that answers questions based ONLY on the provided context."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1 if strict_mode else 0.2,
-            max_tokens=500
+        langfuse_context.update_current_observation(
+            usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens},
+            model="llama-3.3-70b-versatile"
         )
-
-        answer = response.choices[0].message.content
-        sources_str = "\n".join(sources_set)
-
-        if gen_ctx:
-            gen_obs.update(
-                output=answer,
-                usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens},
-            )
-    finally:
-        if gen_ctx:
-            gen_ctx.__exit__(None, None, None)
+    except Exception:
+        pass
 
     return answer, sources_str, context
 
 
+@observe(as_type="generation", name="groundedness-check")
 def check_groundedness(answer, context):
-    try:
-        langfuse = get_langfuse_client()
-    except Exception:
-        langfuse = None
-
     prompt = f"""You are a groundedness evaluator. Your job is to check whether an ANSWER
 is fully supported by the given CONTEXT.
 
@@ -396,108 +356,75 @@ Respond ONLY with valid JSON (no markdown, no extra text):
   "confidence": 0.0 to 1.0
 }}"""
 
-    gen_ctx = None
-    if langfuse:
-        gen_ctx = langfuse.start_as_current_observation(
-            as_type="generation", name="groundedness-check",
-            model="llama-3.3-70b-versatile",
-            input=[{"role": "system", "content": "Strict factual evaluator"}, {"role": "user", "content": prompt}],
-        )
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a strict factual evaluator. Respond ONLY with valid JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.0,
+        max_tokens=300
+    )
 
     try:
-        if gen_ctx:
-            gen_obs = gen_ctx.__enter__()
+        result = json.loads(response.choices[0].message.content)
+    except json.JSONDecodeError:
+        result = {"verdict": "grounded", "unsupported_claims": [], "confidence": 0.5}
 
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "You are a strict factual evaluator. Respond ONLY with valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.0,
-            max_tokens=300
+    try:
+        langfuse_context.update_current_observation(
+            usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens},
+            model="llama-3.3-70b-versatile"
         )
-
-        try:
-            result = json.loads(response.choices[0].message.content)
-        except json.JSONDecodeError:
-            result = {"verdict": "grounded", "unsupported_claims": [], "confidence": 0.5}
-
-        if gen_ctx:
-            gen_obs.update(
-                output=result,
-                usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens},
-            )
-    finally:
-        if gen_ctx:
-            gen_ctx.__exit__(None, None, None)
+    except Exception:
+        pass
 
     return result
 
 
-def generate_answer_with_healing(query, max_retries=1):
+@observe(name="self-healing-rag")
+def generate_answer_with_healing(query, session_id=None, max_retries=1):
+    try:
+        if session_id:
+            langfuse_context.update_current_trace(session_id=session_id, tags=["real-estate-bot"])
+    except Exception:
+        pass
+
     initialize_components()
 
-    try:
-        langfuse = get_langfuse_client()
-    except Exception:
-        langfuse = None
+    for attempt in range(max_retries + 1):
+        is_retry = attempt > 0
+        n_retrieve = 20 if is_retry else 10
+        top_k = 8 if is_retry else 4
 
-    trace_ctx = None
-    if langfuse:
-        trace_ctx = langfuse.start_as_current_observation(
-            as_type="span", name="self-healing-rag",
-            input={"query": query},
-            metadata={"max_retries": max_retries},
-        )
+        answer, sources, context = generate_answer(query, n_retrieve, top_k, is_retry)
 
-    try:
-        if trace_ctx:
-            trace_obs = trace_ctx.__enter__()
+        if context == "":
+            evaluation = {"verdict": "grounded", "unsupported_claims": [], "confidence": 1.0, "attempt": attempt + 1, "no_context": True}
+            return answer, sources, evaluation
 
-        for attempt in range(max_retries + 1):
-            is_retry = attempt > 0
-            n_retrieve = 20 if is_retry else 10
-            top_k = 8 if is_retry else 4
+        evaluation = check_groundedness(answer, context)
+        evaluation["attempt"] = attempt + 1
 
-            answer, sources, context = generate_answer(query, n_retrieve, top_k, is_retry)
+        try:
+            langfuse_context.score_current_trace(
+                name="groundedness",
+                value=1.0 if evaluation["verdict"] == "grounded" else 0.0,
+                comment=f"Confidence: {evaluation.get('confidence', 'N/A')}, Attempt: {attempt + 1}",
+            )
+        except Exception:
+            pass
 
-            if context == "":
-                evaluation = {"verdict": "grounded", "unsupported_claims": [], "confidence": 1.0, "attempt": attempt + 1, "no_context": True}
-                if trace_ctx:
-                    trace_obs.update(output={"answer": answer, "verdict": "grounded", "attempt": attempt + 1, "no_context": True})
-                return answer, sources, evaluation
+        if evaluation["verdict"] == "grounded":
+            return answer, sources, evaluation
 
-            evaluation = check_groundedness(answer, context)
-            evaluation["attempt"] = attempt + 1
+        if attempt < max_retries:
+            print(f"[WARNING] Hallucination detected (attempt {attempt + 1}), retrying with stricter settings...")
+            continue
 
-            if langfuse:
-                try:
-                    langfuse.score_current_trace(
-                        name="groundedness",
-                        value=1.0 if evaluation["verdict"] == "grounded" else 0.0,
-                        comment=f"Confidence: {evaluation.get('confidence', 'N/A')}, Attempt: {attempt + 1}",
-                    )
-                except Exception:
-                    pass
-
-            if evaluation["verdict"] == "grounded":
-                if trace_ctx:
-                    trace_obs.update(output={"answer": answer, "verdict": "grounded", "attempt": attempt + 1})
-                return answer, sources, evaluation
-
-            if attempt < max_retries:
-                print(f"[WARNING] Hallucination detected (attempt {attempt + 1}), retrying with stricter settings...")
-                continue
-
-        fallback_result = (
-            "I don't have enough information in the provided articles to answer this question accurately.",
-            sources,
-            {"verdict": "hallucinated", "unsupported_claims": evaluation.get("unsupported_claims", []), "confidence": 0.0, "attempt": max_retries + 1, "fallback": True}
-        )
-        if trace_ctx:
-            trace_obs.update(output={"verdict": "hallucinated", "fallback": True, "attempt": max_retries + 1})
-        return fallback_result
-    finally:
-        if trace_ctx:
-            trace_ctx.__exit__(None, None, None)
+    fallback_result = (
+        "I don't have enough information in the provided articles to answer this question accurately.",
+        sources,
+        {"verdict": "hallucinated", "unsupported_claims": evaluation.get("unsupported_claims", []), "confidence": 0.0, "attempt": max_retries + 1, "fallback": True}
+    )
+    return fallback_result
