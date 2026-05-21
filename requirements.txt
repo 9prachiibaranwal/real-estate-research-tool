@@ -1,7 +1,8 @@
-streamlit
-chromadb
-groq
-sentence-transformers
-python-dotenv
-beautifulsoup4
-requests
+streamlit>=1.42.0
+chromadb>=1.5.5
+groq>=1.1.1
+sentence-transformers>=5.2.0
+python-dotenv>=1.2.2
+beautifulsoup4>=4.13.3
+requests>=2.34.2
+langfuse>=4.6.1

@@ -1,0 +1,121 @@
+## Architecture in Simple Words
+
+Think of this project as a **smart Q&A assistant** for real estate news. It has **two phases**:
+
+### Phase 1: "Learn" — Process URLs (Data Ingestion)
+
+```
+User pastes URLs → Validate → Scrape web pages → Break text into chunks → Convert to numbers → Store in database
+```
+
+1. **User gives news article URLs** via the Streamlit sidebar
+2. **URL Validation** — Each URL is checked for proper `http://` or `https://` format before processing
+3. **Web Scraping** — `BeautifulSoup` fetches and cleans the webpage content (removes ads, nav bars, etc.)
+4. **Chunking** — The long article text is split into small ~1000 character pieces using a recursive splitter that preserves semantic boundaries (paragraph → line → sentence → word splits)
+5. **Embedding** — Each chunk is converted into a numerical vector using the `all-MiniLM-L6-v2` model **locally**
+6. **Storage** — These vectors + text are stored in **ChromaDB** (in-memory vector database, session-isolated)
+
+### Phase 2: "Answer" — Ask Questions (Self-Healing RAG Pipeline)
+
+```
+User asks question → Find relevant chunks → Rerank → Send to LLM → Check groundedness → Return or retry
+```
+
+1. **User types a question** in the Streamlit UI
+2. **Retrieval** — The question is converted to a vector, then ChromaDB finds the **10 most similar chunks** from the stored articles
+3. **Reranking** — A CrossEncoder model (`ms-marco-MiniLM-L-6-v2`) reranks the 10 candidates and selects the **top 4** most relevant ones
+4. **Distance Filtering** — Chunks with cosine distance > 0.5 are discarded to prevent irrelevant context from reaching the LLM
+5. **Generation** — The filtered chunks are packed into a prompt and sent to **Groq's API** (Llama 3.3 70B)
+6. **Groundedness Check** — A separate LLM call evaluates whether the answer is supported by the context
+7. **Self-Healing** — If hallucination is detected, the system retries with wider retrieval (20 chunks → top 8) and a stricter prompt. After max retries, a safe fallback message is returned.
+
+---
+
+### Visual Flow
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  STREAMLIT UI (main.py)              │
+│          User enters URLs & asks questions           │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│                    rag.py                            │
+│                                                     │
+│  ┌───────────┐   ┌────────────┐   ┌──────────────┐  │
+│  │ Validate  │──▶│ Scrape     │──▶│ Chunk text   │  │
+│  │ URLs      │   │ (requests  │   │ (recursive   │  │
+│  │           │   │  + BS4)    │   │  ~1000 char) │  │
+│  └───────────┘   └────────────┘   └──────┬───────┘  │
+│                                          │          │
+│                                          ▼          │
+│                                   ┌──────────────┐  │
+│                                   │ Embed chunks │  │
+│                                   │ (MiniLM-L6   │  │
+│                                   │  LOCAL CPU)  │  │
+│                                   └──────┬───────┘  │
+│                                          │          │
+│                                          ▼          │
+│                                   ┌────────────┐    │
+│                                   │ ChromaDB   │    │
+│                                   │ (In-Memory │    │
+│                                   │  Ephemeral)│    │
+│                                   └──────┬─────┘    │
+│                                          │          │
+│   User Question ──▶ Embed query ──▶ Find top 10    │
+│                     matching chunks ─────┘          │
+│                          │                          │
+│                          ▼                          │
+│                   ┌─────────────┐                   │
+│                   │  CrossEncoder│                   │
+│                   │  Reranker   │ ◀── LOCAL         │
+│                   │  (top 4)    │                   │
+│                   └──────┬──────┘                   │
+│                          │                          │
+│                          ▼                          │
+│                   ┌─────────────┐                   │
+│                   │  Groq API   │ ◀── CLOUD         │
+│                   │ (Llama 3.3  │                   │
+│                   │   70B LLM)  │                   │
+│                   └──────┬──────┘                   │
+│                          │                          │
+│                          ▼                          │
+│                   ┌──────────────┐                  │
+│                   │ Groundedness │                  │
+│                   │ Check (LLM)  │                  │
+│                   └──────┬───────┘                  │
+│                          │                          │
+│                   Grounded? ──No──▶ Retry/Fallback  │
+│                     │ Yes                           │
+│                     ▼                               │
+│              Answer + Sources                       │
+└─────────────────────────────────────────────────────┘
+```
+
+### Observability
+
+All pipeline steps are traced via **Langfuse**:
+- Retrieval span (ChromaDB query)
+- Reranking span (CrossEncoder scoring)
+- Generation span (Groq LLM call)
+- Groundedness evaluation span
+- Groundedness score logged per trace
+
+### Key Components Summary
+
+| Component | Role | Runs Where |
+|---|---|---|
+| **Streamlit** (`main.py`) | Web UI — take URLs & questions, show answers | Your server |
+| **BeautifulSoup + Requests** | Scrape article content from URLs | Your server |
+| **SentenceTransformer** (MiniLM) | Convert text → vector embeddings | Your server (CPU) |
+| **CrossEncoder** (ms-marco) | Rerank retrieved chunks for relevance | Your server (CPU) |
+| **ChromaDB** (EphemeralClient) | Store & search vectors (in-memory, per-session) | Your server (RAM) |
+| **Groq API** (Llama 3.3 70B) | Generate natural language answers | Groq cloud (LPU) |
+| **Langfuse** | Observability — traces, spans, scores | Langfuse cloud |
+
+### Session Isolation
+
+Each Streamlit user session gets its own ChromaDB collection (`real_estate_{session_id}`), preventing data collisions between concurrent users. Models are loaded once and shared safely via `@st.cache_resource`.
+
+In one line: **Validate URLs → Scrape articles → store as vectors → when user asks a question, find relevant pieces → rerank → send to LLM → verify groundedness → return a trusted answer.** This is an enhanced **RAG (Retrieval-Augmented Generation)** pattern with self-healing capabilities.

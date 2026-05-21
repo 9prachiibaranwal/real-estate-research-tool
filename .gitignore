@@ -1,6 +1,8 @@
 .env
+.streamlit/secrets.toml
 resources/vectorstore/
 __pycache__/
 *.pyc
 venv/
 .venv/
+output.log
