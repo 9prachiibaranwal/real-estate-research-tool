@@ -276,14 +276,15 @@ def generate_answer(query, n_retrieve=10, top_k=4, strict_mode=False):
             reverse=True
         )
 
-        MAX_COSINE_DISTANCE = 0.5
+        # Remove the strict ChromaDB distance filter. The reranker has already
+        # ordered the best chunks, and the LLM is explicitly prompted to say 
+        # "I don't know" if the provided context doesn't contain the answer.
         context_parts = []
         sources_set = set()
         for doc, meta, dist, score in ranked[:top_k]:
-            if dist <= MAX_COSINE_DISTANCE:
-                source = meta.get("source", "Unknown")
-                sources_set.add(source)
-                context_parts.append(f"[Source: {source}]\n{doc}")
+            source = meta.get("source", "Unknown")
+            sources_set.add(source)
+            context_parts.append(f"[Source: {source}]\n{doc}")
 
         if not context_parts:
             no_info_answer = "I don't have enough information in the provided articles to answer this question."
