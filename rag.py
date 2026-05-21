@@ -21,6 +21,15 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 load_dotenv()
 
+# Force Langfuse keys into environment variables from Streamlit secrets
+# This ensures Streamlit Cloud deployments reliably pick up the keys
+try:
+    for key in ["LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST"]:
+        if key in st.secrets:
+            os.environ[key] = st.secrets[key]
+except Exception:
+    pass
+
 # Langfuse observability — imported AFTER load_dotenv() per Langfuse best practices
 from langfuse import get_client as get_langfuse_client
 
