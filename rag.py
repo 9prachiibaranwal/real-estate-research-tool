@@ -24,7 +24,7 @@ load_dotenv()
 # Force Langfuse keys into environment variables from Streamlit secrets
 # This ensures Streamlit Cloud deployments reliably pick up the keys
 try:
-    for key in ["LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST"]:
+    for key in ["LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL"]:
         if key in st.secrets:
             os.environ[key] = st.secrets[key]
 except Exception:
@@ -365,7 +365,7 @@ Answer:"""
         if gen_ctx:
             gen_obs.update(
                 output=answer,
-                usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens},
+                usage_details={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens, "total": response.usage.total_tokens},
             )
     finally:
         if gen_ctx:
@@ -426,7 +426,7 @@ Respond ONLY with valid JSON (no markdown, no extra text):
         if gen_ctx:
             gen_obs.update(
                 output=result,
-                usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens},
+                usage_details={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens, "total": response.usage.total_tokens},
             )
     finally:
         if gen_ctx:
